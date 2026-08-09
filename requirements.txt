@@ -1,0 +1,22 @@
+# VGGT is not on PyPI, and its own metadata pins `numpy<2`. That pin is
+# stale: the model runs correctly on numpy 2.4.4 (verified), and honouring it
+# would force a pointless downgrade. Install it without dependencies.
+#
+#   pip install --no-deps git+https://github.com/facebookresearch/vggt.git
+#
+# PyTorch must come from the index matching your hardware. PyPI serves a
+# CPU-only build, which silently ignores an available GPU:
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu126 torch torchvision
+#
+# Then install this file.
+
+numpy>=2.0
+Pillow>=10.0
+einops>=0.8
+safetensors>=0.4
+huggingface_hub>=0.26
+
+fastapi>=0.141.0
+uvicorn[standard]>=0.35.0
+python-multipart>=0.0.20   # FastAPI needs this to accept file uploads

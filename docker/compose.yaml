@@ -1,0 +1,31 @@
+services:
+  reconstruction:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: vggt-reconstruction-service:latest
+    ports:
+      - "8000:8000"
+    environment:
+      VGGT_MODEL: facebook/VGGT-1B
+      VGGT_DEVICE: "cuda:0"
+      # Raise this only with headroom to spare. On a 16 GB card 8 views is
+      # comfortable; on 8 GB even 4 will page to host memory. /readyz reports
+      # the headroom it actually measured at startup.
+      VGGT_MAX_VIEWS: "4"
+      VGGT_ARTIFACT_DIR: /data/artifacts
+    volumes:
+      - artifacts:/data/artifacts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  artifacts:

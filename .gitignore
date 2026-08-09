@@ -1,0 +1,23 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Model weights and reconstruction outputs
+*.pt
+*.safetensors
+artifacts/
+*.ply
+*.npz
+
+# Sample images are distributed under Meta's VGGT License and are not
+# redistributed here. See README.md for how to fetch them.
+examples/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

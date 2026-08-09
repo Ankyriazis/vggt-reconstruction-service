@@ -1,0 +1,29 @@
+THIRD-PARTY TERMS
+=================
+
+The MIT licence in LICENSE covers the code in this repository only. It does
+not, and cannot, relicense the model this service drives.
+
+This repository does not redistribute VGGT's source, its trained weights, or
+its sample images. They are installed from source and downloaded at runtime,
+so their terms apply to you directly.
+
+VGGT source code
+----------------
+Meta VGGT License: a bespoke research licence with an Acceptable Use Policy
+and its own redistribution requirements.
+https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt
+
+facebook/VGGT-1B weights
+------------------------
+CC BY-NC 4.0. NON-COMMERCIAL USE ONLY.
+https://huggingface.co/facebook/VGGT-1B
+
+Commercial use
+--------------
+Requires the separately granted facebook/VGGT-1B-Commercial checkpoint.
+https://huggingface.co/facebook/VGGT-1B-Commercial
+
+Running this service against the default checkpoint inside a commercial
+product would breach the weights' licence. Wrapping a model in an API does
+not change which checkpoint you are running.

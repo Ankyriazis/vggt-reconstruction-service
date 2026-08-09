@@ -196,7 +196,7 @@ preference.**
 
 | | |
 |---|---|
-| This service's code | MIT — see [LICENSE](LICENSE) |
+| This service's code | MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE) |
 | VGGT code | [Meta VGGT License](https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt) — a bespoke research licence with an Acceptable Use Policy and redistribution terms |
 | `facebook/VGGT-1B` weights | **CC BY-NC 4.0 — non-commercial** |
 | Commercial use | Requires [`facebook/VGGT-1B-Commercial`](https://huggingface.co/facebook/VGGT-1B-Commercial), granted by application |

@@ -135,15 +135,21 @@ jobs make the tail worse while improving nothing.
 **A failed job must not kill the worker.** The handler catches broadly and marks the job
 failed, because one malformed upload should not stop the queue for everyone.
 
-**Retention is enforced when jobs finish, not only when they are submitted.** Enforcing it
-solely on submit was a real bug caught by a test: a burst of six jobs leaves every earlier
-job still queued and therefore not evictable, so the store stayed over its limit
-indefinitely once the burst ended.
+**Retention keeps the last N finished jobs, and their files go with them.** Only finished
+jobs count against `VGGT_JOB_RETENTION`, and they are evicted oldest first as each job
+finishes. Two earlier versions got this wrong. Enforcing it only on submit, a bug caught by
+a test, left the store over its limit after a burst. Counting queued jobs, a bug caught by
+the TLA+ model, evicted each result the moment it finished once a backlog reached the limit,
+so its client got 404 for a job that had succeeded. An evicted job's directory is deleted
+with it, and startup deletes the directories a previous process left: their jobs died with
+it.
 
 **Artifact paths are resolved inside the job directory.** A crafted artifact name cannot
 escape it; there is a test for exactly that.
 
-**Uploads are deleted once consumed.** The service keeps derived outputs, not user images.
+**Uploads are deleted once the job has run, whether or not it succeeded.** The service keeps
+derived outputs, not user images. They are staged in `.uploads` under the artifact
+directory, and startup deletes any that a previous process left.
 
 ## Configuration
 
@@ -153,8 +159,8 @@ escape it; there is a test for exactly that.
 | `VGGT_DEVICE` | auto | `cuda:0`, `cpu` |
 | `VGGT_MAX_VIEWS` | `4` | Images per job. A VRAM limit, not a model limit |
 | `VGGT_MIN_VIEWS` | `1` | One view yields monocular depth only |
-| `VGGT_JOB_RETENTION` | `100` | Finished jobs kept in memory |
-| `VGGT_ARTIFACT_DIR` | `artifacts` | Where outputs are written |
+| `VGGT_JOB_RETENTION` | `100` | Finished jobs kept, with their files |
+| `VGGT_ARTIFACT_DIR` | `artifacts` | Where outputs are written and uploads staged. One service process per directory |
 | `VGGT_MAX_UPLOAD_BYTES` | `26214400` | Per-image upload cap |
 | `VGGT_EAGER_LOAD` | `true` | Load the model at startup |
 
@@ -164,10 +170,23 @@ escape it; there is a test for exactly that.
 pytest tests/ -v
 ```
 
-20 tests, about two seconds. None load VGGT, touch a GPU, or reach the network — the engine
-is injected through FastAPI's dependency system and the job handler is swapped directly.
-Coverage includes queue retention, a failing job not killing the worker, path-traversal on
-artifact downloads, upload validation, and the 503 paths taken while the model loads.
+28 tests, about two seconds. None load VGGT, touch a GPU, or reach the network — the engine
+is injected through FastAPI's dependency system, and the job handler is either swapped or run
+against a stub engine. Coverage includes queue retention, a failing job not killing the
+worker, path-traversal on artifact downloads, upload validation, the 503 paths taken while
+the model loads, and the files a job leaves behind: uploads after a failure, evicted jobs,
+a previous process's leftovers, and a download that outlives its job's eviction.
+
+The job queue is also model-checked with TLA+: every interleaving of clients, the worker,
+failing jobs, `stop()`/`start()` and a process restart, including the files a job leaves on
+disk. It needs Java 11+ and runs in about 50 seconds:
+
+```bash
+python tla/scripts/model_check.py
+```
+
+[`tla/README.md`](tla/README.md) lists what it checks, what it found, and how each finding
+was fixed.
 
 ## Docker
 
@@ -183,7 +202,7 @@ model load.
 
 - One GPU, one job at a time. Concurrency needs a real queue and several workers; `jobs.py`
   is isolated so it can be replaced.
-- Jobs live in memory and do not survive a restart.
+- Jobs live in memory and do not survive a restart; the next startup deletes their files.
 - No authentication. Put it behind a gateway.
 - Latency figures are from one machine, one scene, and — as the table above shows — depend
   more on free VRAM than on anything else. Treat them as an illustration of the cliff, not

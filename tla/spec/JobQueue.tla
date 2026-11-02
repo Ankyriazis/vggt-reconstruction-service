@@ -4,24 +4,31 @@
 (* of the HTTP layer (src/reconstruction/service.py) that touch a job: the *)
 (* POST /reconstruct that submits it, the GET /jobs/{id} that polls it, the *)
 (* GET /jobs/{id}/artifacts/{name} that downloads it, and the files it      *)
-(* leaves on disk. Each action cites the code it stands for.               *)
+(* leaves on disk. Each action cites the code it stands for, by its line   *)
+(* in commit 75e067f, the code before the fixes this model led to.         *)
 (*                                                                         *)
-(* Code is the set of changes to today's code being checked; {} is the     *)
-(* code as it is.                                                          *)
+(* Code is the set of changes to 75e067f being checked. The code now has   *)
+(* the last five; {} is the code as it was.                                *)
 (*                                                                         *)
 (*   "EvictOnSubmitOnly"  the code before eviction also ran as jobs        *)
 (*                        finished: the retention bug the tests caught     *)
 (*   "CleanUploads"       a job's uploads are deleted whatever its         *)
 (*                        outcome, and startup deletes any a previous      *)
-(*                        process left                                     *)
-(*   "RetainFinished"     retention counts finished jobs only, and evicts  *)
-(*                        them in the order they finished                  *)
+(*                        process left (service.py: _handle_job,           *)
+(*                        _discard_leftovers)                              *)
+(*   "RetainFinished"     retention counts finished jobs only, evicts them *)
+(*                        in the order they finished, and only as a job    *)
+(*                        finishes (jobs.py: JobQueue._finish_locked)      *)
 (*   "DeleteFiles"        an evicted or failed job's directory is deleted, *)
 (*                        and startup deletes job directories a previous   *)
-(*                        process left                                     *)
+(*                        process left (service.py: _discard_job via       *)
+(*                        JobQueue's on_evict, _handle_job,                *)
+(*                        _discard_leftovers)                              *)
 (*   "OpenFirst"          the artifact handler opens the file before it    *)
 (*                        answers, instead of leaving that to FileResponse *)
-(*   "SingleUse"          start() after stop() raises                      *)
+(*                        (service.py: get_artifact)                       *)
+(*   "SingleUse"          start() after stop() raises (jobs.py:            *)
+(*                        JobQueue.start)                                  *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -157,13 +164,14 @@ Doom(e) == doomed' = IF Has("DeleteFiles") THEN doomed \cup e ELSE doomed
 
 (* POST /reconstruct writes the images to a staging directory              *)
 (* (service.py:192-217), then JobQueue.submit adds the job and evicts      *)
-(* under the lock (jobs.py:112-115).                                       *)
+(* under the lock (jobs.py:112-115). With "RetainFinished" submit does not *)
+(* evict: it adds no finished job.                                         *)
 Register(j) ==
     /\ cpc[j] = "idle"
     /\ LET t   == tracked \cup {j}
            ord == Append(order, j)
            st  == [status EXCEPT ![j] = "queued"]
-           e   == Evicted(t, ord, st)
+           e   == IF Has("RetainFinished") THEN {} ELSE Evicted(t, ord, st)
        IN  /\ status' = st
            /\ order' = ord
            /\ tracked' = t \ e
@@ -200,6 +208,9 @@ Poll(j) ==
 (* opens the file only when the response is sent. With "OpenFirst" the     *)
 (* handler opens the file itself and streams from the open file, which     *)
 (* deleting the directory does not affect (POSIX; the image is Linux).     *)
+(* The handler checks the status before it opens the file; a job evicted   *)
+(* in between either opens before the delete and streams, or answers 404,  *)
+(* the two outcomes this step already has.                                 *)
 Download(j) ==
     /\ cpc[j] = "download"
     /\ cpc' = [cpc EXCEPT ![j] =

@@ -1,7 +1,7 @@
 """Model-check spec/JobQueue.tla under each of its configurations.
 
     python scripts/model_check.py            # all checks
-    python scripts/model_check.py Fixed      # only configs whose name contains "Fixed"
+    python scripts/model_check.py Without    # only configs whose name contains "Without"
 
 Each .cfg says at the top what it asks and, on its "Expected:" line, either
 "all properties hold" or which property should fail. Writes
@@ -16,13 +16,14 @@ from tlc import ROOT, describe_trace, function_value, run_tlc
 SPEC = ROOT / "spec" / "JobQueue.tla"
 OUT = ROOT / "out" / "model-check"
 
-# Today's code first, then the proposed fix, each of its changes left out in
-# turn, and the witnesses that its passes are not vacuous.
-ORDER = ["Service", "OldEviction", "FailedJob", "Backlog", "EvictedFiles",
-         "RestartFiles", "QueueRestart", "QueueRestartStalls", "Fixed", "FixedStop",
-         "FixedWithoutCleanUploads", "FixedWithoutRetainFinished", "FixedWithoutDeleteFiles",
-         "FixedWithoutOpenFirst", "FixedWithoutSingleUse",
-         "WitnessDeleteDuringDownload", "WitnessMissedResult"]
+# The code as it is, each of the fixes left out in turn, and the witnesses that
+# its passes are not vacuous; then the code before the fixes (75e067f).
+ORDER = ["Service", "ServiceStop",
+         "WithoutCleanUploads", "WithoutRetainFinished", "WithoutDeleteFiles",
+         "WithoutOpenFirst", "WithoutSingleUse",
+         "WitnessDeleteDuringDownload", "WitnessMissedResult",
+         "Before", "OldEviction", "FailedJob", "Backlog", "EvictedFiles",
+         "RestartFiles", "QueueRestart", "QueueRestartStalls"]
 
 # Variables a counterexample lists; the rest are bookkeeping.
 SHOW = {"status", "tracked", "finished", "queue", "stopping", "worker", "wpc",

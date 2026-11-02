@@ -41,9 +41,9 @@ class Settings:
             4 views and 8.25 GB at 8, and once allocation passes the physical
             limit the driver spills to host memory and per-view cost rises
             from 0.72 s to 1.16 s. Raise it if you have more VRAM.
-        job_retention: Completed jobs kept in memory before the oldest are
-            dropped. Results reference files on disk, so this bounds metadata
-            rather than pixel data.
+        job_retention: Finished jobs kept before the oldest are dropped,
+            together with their output files on disk. Queued and running jobs
+            are always kept and do not count.
     """
 
     model: str = field(default_factory=lambda: _env_str("VGGT_MODEL", "facebook/VGGT-1B"))

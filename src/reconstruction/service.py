@@ -13,6 +13,9 @@ restarted forever.
 from __future__ import annotations
 
 import logging
+import mimetypes
+import os
+import re
 import shutil
 import tempfile
 import time
@@ -20,7 +23,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 
 from .artifacts import write_results
 from .config import Settings
@@ -38,6 +41,13 @@ _state: dict = {
 }
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+# Uploads are staged in a folder of their own under the artifact directory,
+# rather than the system temp directory, so that startup can find and delete
+# whatever a previous process left there.
+STAGING_DIR = ".uploads"
+STAGING_PREFIX = "vggt-upload-"
+JOB_ID = re.compile(r"[0-9a-f]{12}")
 
 
 def get_queue() -> JobQueue:
@@ -62,15 +72,76 @@ def require_engine() -> ReconstructionEngine:
     return engine
 
 
+def _job_dir(job_id: str) -> Path:
+    return Path(_state["artifact_root"]) / job_id
+
+
+def _staging_root() -> Path:
+    return Path(_state["artifact_root"]) / STAGING_DIR
+
+
 def _handle_job(job_id: str, image_paths: list[Path]):
-    """Run one reconstruction. Executed on the worker thread."""
-    engine = _state["engine"]
-    result = engine.reconstruct(image_paths)
-    directory = Path(_state["artifact_root"]) / job_id
-    artifacts = write_results(result, directory)
-    for path in image_paths:  # uploads are not kept once consumed
-        path.unlink(missing_ok=True)
-    return result.summary(), artifacts
+    """Run one reconstruction. Executed on the worker thread.
+
+    The uploads are deleted whatever the outcome. The service keeps derived
+    outputs, not user images, and a job that failed has no more use for them
+    than one that succeeded. A failed write leaves no partial directory either:
+    a failed job serves no artifacts.
+    """
+    try:
+        result = _state["engine"].reconstruct(image_paths)
+        directory = _job_dir(job_id)
+        try:
+            artifacts = write_results(result, directory)
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        return result.summary(), artifacts
+    finally:
+        _discard_uploads(image_paths)
+
+
+def _discard_uploads(image_paths: list[Path]) -> None:
+    """Delete the staging directory a job's uploads were saved in."""
+    for staging in {path.parent for path in image_paths}:
+        if staging.parent == _staging_root():  # only directories the service made
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _discard_job(job_id: str) -> None:
+    """Delete an evicted job's outputs; the queue calls this as it evicts.
+
+    On Windows a file that is being downloaded cannot be deleted. It is left
+    for the next startup, which deletes it.
+    """
+    shutil.rmtree(_job_dir(job_id), ignore_errors=True)
+
+
+def _discard_leftovers(artifact_root: Path) -> None:
+    """Delete the job directories and uploads a previous process left.
+
+    Jobs live in memory, so once the process that ran them has gone nothing
+    can reach their files, and the artifact directory is often a volume that
+    outlives the container. Only names this service creates are touched, since
+    the directory is configurable and may hold other things. That assumes one
+    process per artifact directory, as one worker per GPU already does.
+    """
+    leftovers = [path for path in artifact_root.iterdir()
+                 if path.is_dir() and JOB_ID.fullmatch(path.name)]
+    staging = artifact_root / STAGING_DIR
+    if staging.is_dir():
+        leftovers += staging.glob(f"{STAGING_PREFIX}*")
+    for path in leftovers:
+        shutil.rmtree(path, ignore_errors=True)
+    if leftovers:
+        logger.info("deleted %d job directories and uploads left by a previous run",
+                    len(leftovers))
+
+
+def _read_chunks(handle, size: int = 1024 * 1024):
+    with handle:
+        while chunk := handle.read(size):
+            yield chunk
 
 
 @asynccontextmanager
@@ -81,9 +152,11 @@ async def lifespan(app: FastAPI):
 
     artifact_root = Path(settings.artifact_dir).resolve()
     artifact_root.mkdir(parents=True, exist_ok=True)
+    _discard_leftovers(artifact_root)
+    (artifact_root / STAGING_DIR).mkdir(exist_ok=True)
     _state["artifact_root"] = artifact_root
 
-    job_queue = JobQueue(_handle_job, retention=settings.job_retention)
+    job_queue = JobQueue(_handle_job, retention=settings.job_retention, on_evict=_discard_job)
     job_queue.start()
     _state["queue"] = job_queue
 
@@ -189,7 +262,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ),
             )
 
-        staging = Path(tempfile.mkdtemp(prefix="vggt-upload-"))
+        staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=_staging_root()))
         saved: list[Path] = []
         try:
             for index, upload in enumerate(files):
@@ -250,11 +323,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         # Resolve inside the job directory so a crafted name cannot escape it.
-        root = (Path(_state["artifact_root"]) / job_id).resolve()
+        root = _job_dir(job_id).resolve()
         candidate = (root / name).resolve()
-        if not str(candidate).startswith(str(root)) or not candidate.is_file():
+        if not str(candidate).startswith(str(root)):
             raise HTTPException(status_code=404, detail=f"No artifact {name!r}.")
-        return FileResponse(candidate, filename=f"{job_id}-{name}")
+
+        # Open the file here rather than return a FileResponse, which opens it
+        # only while sending, after the 200 has gone out. In between the job
+        # can be evicted and its directory deleted. A file that is already
+        # open stays readable when deleted.
+        try:
+            handle = candidate.open("rb")
+        except OSError:  # missing, or a directory
+            raise HTTPException(status_code=404, detail=f"No artifact {name!r}.") from None
+        return StreamingResponse(
+            _read_chunks(handle),
+            media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+            headers={
+                "Content-Length": str(os.fstat(handle.fileno()).st_size),
+                "Content-Disposition": f'attachment; filename="{job_id}-{name}"',
+            },
+        )
 
     return app
 

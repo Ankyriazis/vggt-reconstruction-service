@@ -17,7 +17,8 @@ import queue
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -75,27 +76,50 @@ class JobQueue:
     real constraint, which is that the card can only do one job at a time.
     The moment you need several GPU workers, or jobs to survive a restart,
     this is the piece to replace - and it is isolated so that it can be.
+
+    on_evict, if given, is called with the id of each job dropped by
+    retention, on the worker thread and outside the lock, so that whatever the
+    job left on disk can go with it.
     """
 
-    def __init__(self, handler, retention: int = 100) -> None:
+    def __init__(
+        self,
+        handler,
+        retention: int = 100,
+        on_evict: Callable[[str], None] | None = None,
+    ) -> None:
         self._handler = handler
         self._retention = retention
+        self._on_evict = on_evict
         self._queue: queue.Queue[str] = queue.Queue()
         self._jobs: OrderedDict[str, Job] = OrderedDict()
+        self._finished: deque[str] = deque()  # ids of finished jobs, oldest first
         self._payloads: dict[str, list[Path]] = {}
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._stopping = threading.Event()
+        self._stopped = False
 
     def start(self) -> None:
+        """Start the worker. A queue runs once: start() after stop() raises.
+
+        stop() cannot always wait for the worker, because a job outlasts its
+        timeout. A restarted queue would then run a second worker beside the
+        first, two jobs on one GPU; or, when the join did succeed, hand the
+        stop signal the first worker never consumed to the new one, which
+        exits on it and leaves every later job queued. Make a new JobQueue
+        instead.
+        """
+        if self._stopped:
+            raise RuntimeError("a JobQueue cannot be restarted; create a new one")
         if self._worker is not None:
             return
-        self._stopping.clear()
         self._worker = threading.Thread(target=self._run, name="reconstruction", daemon=True)
         self._worker.start()
         logger.info("job worker started")
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._stopped = True
         self._stopping.set()
         self._queue.put("")  # unblock the worker so it can notice the flag
         if self._worker is not None:
@@ -112,7 +136,6 @@ class JobQueue:
         with self._lock:
             self._jobs[job.id] = job
             self._payloads[job.id] = image_paths
-            self._evict_locked()
         self._queue.put(job.id)
         return job
 
@@ -135,20 +158,34 @@ class JobQueue:
                 "by_status": counts,
             }
 
-    def _evict_locked(self) -> None:
-        """Drop the oldest finished jobs once retention is exceeded.
+    def _finish_locked(self, job_id: str) -> list[str]:
+        """Record a finished job and evict the oldest finished ones over retention.
 
         Only finished jobs are evicted; dropping a queued or running one would
-        strand a client polling for a job id that quietly disappeared.
+        strand a client polling for a job id that quietly disappeared. Only
+        finished jobs count against retention, too. Counting the queued ones
+        strands clients the same way: once a backlog reaches the limit, every
+        result is evicted as soon as it finishes, before its client can poll.
+
+        Eviction happens here, as jobs finish, because nothing else adds a
+        finished job. Returns the evicted ids.
         """
-        while len(self._jobs) > self._retention:
-            for job_id, job in list(self._jobs.items()):
-                if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
-                    self._jobs.pop(job_id, None)
-                    self._payloads.pop(job_id, None)
-                    break
-            else:
-                return  # nothing evictable; let the queue exceed retention
+        self._payloads.pop(job_id, None)
+        self._finished.append(job_id)
+        evicted = []
+        while len(self._finished) > self._retention:
+            oldest = self._finished.popleft()
+            self._jobs.pop(oldest, None)
+            evicted.append(oldest)
+        return evicted
+
+    def _discard(self, job_id: str) -> None:
+        if self._on_evict is None:
+            return
+        try:
+            self._on_evict(job_id)
+        except Exception:  # noqa: BLE001 - cleanup must not kill the worker either
+            logger.exception("cleaning up evicted job %s failed", job_id)
 
     def _run(self) -> None:
         while not self._stopping.is_set():
@@ -176,9 +213,7 @@ class JobQueue:
             finally:
                 job.finished_at = time.time()
                 with self._lock:
-                    self._payloads.pop(job_id, None)
-                    # Also evict here, not only on submit. A burst of
-                    # submissions leaves every earlier job still queued and so
-                    # not yet evictable; without this the store would stay
-                    # over its retention limit until the next submission.
-                    self._evict_locked()
+                    evicted = self._finish_locked(job_id)
+                # Outside the lock, so that polling never waits on the disk.
+                for old_id in evicted:
+                    self._discard(old_id)

@@ -8,8 +8,11 @@ from the model in the first place.
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +51,16 @@ def wait_for(job_queue: JobQueue, job_id: str, timeout: float = 5.0):
             return job
         time.sleep(0.02)
     raise AssertionError(f"job {job_id} did not finish within {timeout}s")
+
+
+def eventually(condition, timeout: float = 2.0) -> bool:
+    """Poll until condition() holds, for effects that follow a job's status."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
 
 
 @pytest.fixture
@@ -134,6 +147,59 @@ def test_retention_evicts_the_oldest_finished_jobs():
 
 def test_unknown_job_is_none():
     assert JobQueue(lambda job_id, paths: ({}, {})).get("nope") is None
+
+
+def test_a_backlog_does_not_evict_finished_results():
+    """Retention counts finished jobs, so waiting ones cannot push results out."""
+    release = threading.Event()
+    calls = []
+
+    def handler(job_id, paths):
+        calls.append(job_id)
+        if len(calls) > 1:  # the first job finishes; the rest wait
+            release.wait(timeout=5)
+        return {}, {}
+
+    job_queue = JobQueue(handler, retention=3)
+    job_queue.start()
+    try:
+        first = wait_for(job_queue, job_queue.submit([]).id)
+        waiting = [job_queue.submit([]).id for _ in range(3)]
+        assert job_queue.get(first.id) is not None, "a backlog evicted a finished result"
+
+        release.set()
+        for job_id in waiting:
+            wait_for(job_queue, job_id)
+        assert eventually(lambda: job_queue.stats()["tracked"] == 3)
+        assert job_queue.get(first.id) is None, "the oldest finished job goes first"
+    finally:
+        release.set()
+        job_queue.stop()
+
+
+def test_eviction_cleanup_runs_and_cannot_kill_the_worker():
+    evicted = []
+
+    def on_evict(job_id):
+        evicted.append(job_id)
+        raise OSError("disk went away")
+
+    job_queue = JobQueue(lambda job_id, paths: ({}, {}), retention=1, on_evict=on_evict)
+    job_queue.start()
+    try:
+        ids = [wait_for(job_queue, job_queue.submit([]).id).id for _ in range(3)]
+        assert eventually(lambda: evicted == ids[:2])
+    finally:
+        job_queue.stop()
+
+
+def test_a_stopped_queue_cannot_be_restarted():
+    """stop() can return while a job still runs; a restart would add a second worker."""
+    job_queue = JobQueue(lambda job_id, paths: ({}, {}))
+    job_queue.start()
+    job_queue.stop()
+    with pytest.raises(RuntimeError, match="restarted"):
+        job_queue.start()
 
 
 # ------------------------------------------------------------------ artifacts
@@ -262,3 +328,124 @@ def test_submitting_before_the_model_loads_is_503(tmp_path):
         response = bare.post("/reconstruct", files=upload(2))
         assert response.status_code == 503
         assert "loading" in response.json()["detail"].lower()
+
+
+# ------------------------------------------------------------------ files
+
+class FakeResult:
+    """Just enough of a ReconstructionResult for write_results and summary()."""
+
+    extrinsics = np.zeros((1, 3, 4), np.float32)
+    intrinsics = np.zeros((1, 3, 3), np.float32)
+    depth = np.zeros((1, 2, 2, 1), np.float32)
+    depth_confidence = np.ones((1, 2, 2), np.float32)
+    world_points = np.zeros((1, 2, 2, 3), np.float32)
+    point_confidence = np.ones((1, 2, 2), np.float32)
+
+    def summary(self) -> dict:
+        return {"views": 1}
+
+
+class CheckingEngine(StubEngine):
+    """Fails on anything that is not a PNG, the way the real loader does."""
+
+    def reconstruct(self, image_paths):
+        for path in image_paths:
+            if not Path(path).read_bytes().startswith(PNG_1x1[:8]):
+                raise ValueError(f"cannot identify image file {str(path)!r}")
+        return FakeResult()
+
+
+@contextmanager
+def running_service(tmp_path, retention: int = 100):
+    """The app with the real job handler, so the files it leaves are real too."""
+    app = create_app(Settings(eager_load=False, artifact_dir=str(tmp_path / "artifacts"),
+                              job_retention=retention))
+    app.dependency_overrides[require_engine] = lambda: CheckingEngine()
+    with TestClient(app) as test_client:
+        service_module._state["engine"] = CheckingEngine()
+        yield test_client
+
+
+def run_job(client, files) -> tuple[str, str]:
+    """Submit a job, wait for it to finish, and return its id and status."""
+    job_id = client.post("/reconstruct", files=files).json()["id"]
+    for _ in range(250):
+        status = client.get(f"/jobs/{job_id}").json()["status"]
+        if status in ("succeeded", "failed"):
+            return job_id, status
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish")
+
+
+def test_uploads_are_deleted_whether_the_job_succeeds_or_fails(tmp_path):
+    """A failed job used to keep the user's images, since only success deleted them."""
+    with running_service(tmp_path) as client:
+        not_an_image = [("files", ("a.png", b"not an image", "image/png"))]
+        assert run_job(client, not_an_image)[1] == "failed"
+        assert run_job(client, upload(2))[1] == "succeeded"
+        assert list((tmp_path / "artifacts" / ".uploads").iterdir()) == []
+
+
+def test_a_failed_write_leaves_no_partial_directory(tmp_path, monkeypatch):
+    def write_partway(result, directory):
+        directory.mkdir(parents=True)
+        (directory / "cameras.npz").write_bytes(b"partial")
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(service_module, "write_results", write_partway)
+    with running_service(tmp_path) as client:
+        job_id, status = run_job(client, upload(2))
+        assert status == "failed"
+        assert not (tmp_path / "artifacts" / job_id).exists()
+
+
+def test_an_evicted_job_takes_its_files_with_it(tmp_path):
+    """Files of evicted jobs used to stay on disk, unreachable, indefinitely."""
+    with running_service(tmp_path, retention=1) as client:
+        first, _ = run_job(client, upload(2))
+        second, _ = run_job(client, upload(2))
+        assert eventually(lambda: client.get(f"/jobs/{first}").status_code == 404)
+        assert eventually(lambda: not (tmp_path / "artifacts" / first).exists())
+        assert client.get(f"/jobs/{second}/artifacts/points.ply").status_code == 200
+
+
+def test_startup_deletes_what_a_previous_process_left(tmp_path):
+    """Jobs do not survive a restart, so their files and uploads go too."""
+    artifacts = tmp_path / "artifacts"
+    old_job = artifacts / "0123456789ab"
+    old_upload = artifacts / ".uploads" / "vggt-upload-x1y2z3"
+    unrelated = artifacts / "notes"
+    for directory in (old_job, old_upload, unrelated):
+        directory.mkdir(parents=True)
+        (directory / "file").write_bytes(b"x")
+
+    with running_service(tmp_path):
+        assert not old_job.exists()
+        assert not old_upload.exists()
+        assert (unrelated / "file").exists(), "only names the service creates are deleted"
+
+
+def test_a_download_survives_its_job_being_evicted(tmp_path):
+    """The handler opens the file itself, so deleting it mid-response is harmless.
+
+    A FileResponse opened the file only while sending, after the 200 had gone
+    out. On Windows the delete fails instead, and the file is left for the
+    next startup, so there this test only checks that the download completes.
+    """
+    with running_service(tmp_path) as client:
+        job_id, _ = run_job(client, upload(2))
+        path = tmp_path / "artifacts" / job_id / "points.ply"
+        expected = path.read_bytes()
+
+        endpoint = next(route.endpoint for route in client.app.routes
+                        if getattr(route, "path", "") == "/jobs/{job_id}/artifacts/{name}")
+        response = endpoint(job_id, "points.ply", service_module._state["queue"])
+        service_module._discard_job(job_id)  # what eviction does
+
+        async def body():
+            return b"".join([chunk async for chunk in response.body_iterator])
+
+        assert asyncio.run(body()) == expected
+        if sys.platform != "win32":
+            assert not path.exists()

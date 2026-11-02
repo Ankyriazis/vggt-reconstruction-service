@@ -169,6 +169,16 @@ is injected through FastAPI's dependency system and the job handler is swapped d
 Coverage includes queue retention, a failing job not killing the worker, path-traversal on
 artifact downloads, upload validation, and the 503 paths taken while the model loads.
 
+The job queue is also model-checked with TLA+: every interleaving of clients, the worker,
+failing jobs, `stop()`/`start()` and a process restart, including the files a job leaves on
+disk. It needs Java 11+ and runs in about 80 seconds:
+
+```bash
+python tla/scripts/model_check.py
+```
+
+[`tla/README.md`](tla/README.md) lists what it checks, what it found, and a fix it verifies.
+
 ## Docker
 
 ```bash
